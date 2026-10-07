@@ -1,6 +1,6 @@
 <div align="center">
 
-# mindclassify — Responsible Mental-Health Text Classification with Llama 3.1 QLoRA
+# mindclassify — Responsible Mental-Health Text Classification With Llama 3.1 QLoRA
 
 **mindclassify is a research benchmark for classifiers of self-disclosed mental-health posts. It takes a labelled corpus through these steps to calibrated, safety-checked results:**
 
@@ -378,7 +378,7 @@ After training, the command fits the temperature and the routing threshold on th
 | `data/Combined Data.csv` | No (git ignores it) | The corpus |
 | `data/synthetic.csv` | No (git ignores it) | Output of `mindclassify synth` |
 | `out/splits.json` | No (git ignores it) | The split IDs from `mindclassify prepare` |
-| `models/<name>/model.json`, `model.joblib`, `MODEL_CARD.md` | No (git ignores them) | Local model folders |
+| `models/<name>/model.json`, `model.joblib`, `MODEL_CARD.md` | No (git ignores them) | Saved model folders |
 | `models/qlora/seed<N>/adapter/` | No (git ignores it) | LoRA adapters |
 | `models/report.md` | No (git ignores it) | Output of `mindclassify train` |
 | `.env.example` | Yes | All 14 variables, empty |
@@ -467,7 +467,7 @@ Credentials are only in a local `.env` file or the environment. Git ignores `.en
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests | **25 passed, 0 skipped**. The same count is expected in CI | `pytest -q` |
+| Unit tests (CI installs only `.[dev]`) | **25 passed, 0 skipped**. No test needs a GPU, a download or an extra | `pytest -q` |
 | Duplicate removal (synthetic, 4,280 posts) | 160 exact copies, 120 near-copy links, 280 posts removed, 0 label conflicts | `mindclassify prepare --synthetic` |
 | `majority` on the synthetic test split (572 posts) | Macro-F1 0.060 [0.054, 0.067], accuracy 0.267 | `mindclassify train --synthetic` |
 | `tfidf` on the synthetic test split | Macro-F1 0.862 [0.827, 0.891], balanced accuracy 0.860, accuracy 0.872, ECE 0.042 | same |
