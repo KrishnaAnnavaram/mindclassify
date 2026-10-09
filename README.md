@@ -74,6 +74,7 @@ This README is the **one location that explains all of mindclassify**. It gives 
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one post](#42-the-life-cycle-of-one-post)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 📥 [The loader and the cleaner](#5-the-loader-and-the-cleaner)
 6. 🧬 [Duplicate groups and the split](#6-duplicate-groups-and-the-split)
 7. 💬 [The prompt template](#7-the-prompt-template)
@@ -147,6 +148,59 @@ flowchart LR
 | Synthetic posts | `src/mindclassify/synthetic.py` | Template posts with imbalance, near classes, noise and copies |
 | CLI | `src/mindclassify/cli.py` | The `mindclassify` command with 8 subcommands |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    CLI["cli.py<br/>mindclassify command"]
+    CFG["config.py<br/>Settings"]
+    subgraph PREP["Data preparation"]
+        PIPE["pipeline.py<br/>prepare"]
+        SYN["synthetic.py<br/>generate"]
+        DATA["data.py<br/>load_csv, load_frame"]
+        CLN["clean.py<br/>clean"]
+        DED["dedup.py<br/>group_duplicates, resolve"]
+        SPL["splits.py<br/>make_split, Split.check"]
+    end
+    subgraph MODELS["Models"]
+        REG["models/__init__.py<br/>build, save, load"]
+        BASE["models/base.py<br/>Classifier, MajorityClassifier"]
+        TF["models/tfidf.py<br/>TfidfClassifier"]
+        LLM["models/llm.py<br/>LLMLabelScorer"]
+        QL["models/qlora.py<br/>train_qlora"]
+        PRM["prompts.py<br/>build_prompt"]
+    end
+    subgraph RESULTS["Results"]
+        EVA["evaluate.py<br/>calibrate_and_route, evaluate"]
+        SAF["safety.py<br/>route, phrase_flags"]
+        REP["report.py<br/>markdown, model_card"]
+    end
+
+    CLI --> CFG
+    CLI --> PIPE
+    CLI --> REG
+    CLI --> QL
+    CLI --> EVA
+    CLI --> SAF
+    CLI --> REP
+    PIPE --> SYN
+    PIPE --> DATA
+    PIPE --> CLN
+    PIPE --> DED
+    PIPE --> SPL
+    SPL --> DED
+    REG --> BASE
+    REG --> TF
+    REG --> LLM
+    TF --> BASE
+    LLM --> BASE
+    LLM --> PRM
+    QL --> PRM
+    EVA --> BASE
+    EVA --> SAF
+    EVA --> SPL
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -184,6 +238,18 @@ mindclassify/
 ### 3.1 One prompt template
 `prompts.build_prompt` is the only prompt function. The QLoRA encoder and the LLM scorer import it, and a test checks that they use the same object. The model folder stores the template version, and `load` refuses a different version.
 
+```mermaid
+flowchart LR
+    BP["prompts.build_prompt<br/>TEMPLATE classify-v1"] --> ENC["train_qlora with qlora.encode<br/>training examples"]
+    BP --> SCR["LLMLabelScorer.log_scores<br/>evaluation and prediction"]
+    BP --> SHOW["mindclassify prompt"]
+    ENC -- "writes" --> MJ[("model.json<br/>template_version")]
+    SV["models.save<br/>majority, tfidf"] -- "writes" --> MJ
+    MJ --> LD{"models.load:<br/>same TEMPLATE_VERSION?"}
+    LD -- "yes" --> USE[/"Model for evaluate or predict"/]
+    LD -- "no" --> ERR[/"ValueError: load refused"/]
+```
+
 ### 3.2 Scores over labels, not parsed text
 The LLM scorer adds each label completion to the prompt and sums its token log-probabilities. A softmax over the labels gives the class probabilities. No answer text is generated or parsed.
 
@@ -212,20 +278,68 @@ The cleaner changes only URLs, mentions, HTML and white space. It keeps negation
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    CSV["Corpus CSV or synthetic posts"] --> L["Load: normalise labels, drop empty and unknown rows"]
+flowchart TD
+    SRC{"--synthetic?"} -- "no" --> CSV[/"Corpus CSV<br/>MINDCLASSIFY_DATA"/]
+    SRC -- "yes" --> SYN["synthetic.generate<br/>template posts"]
+    CSV --> L["Load: normalise labels, drop empty and unknown rows"]
+    SYN --> L
     L --> C["Clean: URL, mention, HTML, white space"]
     C --> D["Duplicate groups: exact + MinHash"]
     D --> R["Resolve: one post per group, majority label, ties dropped"]
     R --> S["Stratified group split: train / validation / test"]
-    S --> F["Fit: majority, tfidf (local) or QLoRA (GPU)"]
+    S --> CHK{"Split.check:<br/>group or text on two sides?"}
+    CHK -- "yes" --> LEAK[/"LeakageError"/]
+    CHK -- "no, prepare command" --> IDS[("out/splits.json<br/>split IDs")]
+    CHK -- "no" --> M{"Model"}
+    M -- "train" --> F["Fit: majority, tfidf (local)"]
+    M -- "train-llm" --> Q["Fit: QLoRA adapter for each seed (GPU)"]
     F --> CAL["Calibrate on validation: temperature, routing threshold"]
+    Q --> CAL
+    CAL --> FOLD[("Model folder<br/>model.json, model.joblib or adapter")]
     CAL --> EV["Evaluate on test: macro-F1, CI, ECE, slices, routing"]
-    EV --> REP["report.md, MODEL_CARD.md"]
-    CAL --> P["predict: probabilities, routing decision, disclaimer"]
+    EV --> REP[/"report.md, MODEL_CARD.md"/]
+    FOLD --> P["predict: probabilities, routing decision, disclaimer"]
+    TXT[/"One text"/] --> P
+    P --> RT{"P(Suicidal) at or above the threshold,<br/>or a crisis phrase?"}
+    RT -- "yes" --> HUMAN{{"HUMAN<br/>trained reviewer and crisis resources"}}
+    RT -- "no" --> OUT[/"Top label, probabilities, disclaimer"/]
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one post
+
+```mermaid
+stateDiagram-v2
+    state "Raw row" as Raw
+    state "Loaded post" as Loaded
+    state "Clean post" as Cleaned
+    state "Post with a group ID" as Grouped
+    state "Kept post of its group" as Kept
+    state "Post in train, val or test" as InSplit
+    state "Log-scores" as Scored
+    state "Calibrated probabilities" as Probs
+    state "Routed to a human" as Routed
+    state "Not routed" as NotRouted
+    state "Dropped" as Dropped
+    [*] --> Raw: load_csv or synthetic.generate
+    Raw --> Dropped: empty text or unknown label
+    Raw --> Loaded: normalise_label
+    Loaded --> Cleaned: clean
+    Cleaned --> Dropped: empty after cleaning
+    Cleaned --> Grouped: group_duplicates
+    Grouped --> Dropped: copy in a group, or label tie
+    Grouped --> Kept: resolve
+    Kept --> InSplit: make_split, Split.check
+    InSplit --> Scored: log_scores
+    Scored --> Probs: softmax with temperature T
+    Probs --> Routed: P(Suicidal) at or above t, or crisis phrase
+    Probs --> NotRouted: below t and no phrase
+    Routed --> [*]
+    NotRouted --> [*]
+    Dropped --> [*]
+```
 
 1. The loader reads the post and normalises its label (for example `Bi-Polar` to `Bipolar`).
 2. The cleaner replaces its URLs and mentions with `<url>` and `<user>`.
@@ -236,9 +350,61 @@ flowchart TB
 7. The routing rule checks P(Suicidal) and the crisis phrases.
 8. The output gives the top label, all probabilities, the routing decision and the disclaimer.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor R as Researcher
+    participant CLI as mindclassify CLI
+    participant PIPE as pipeline.prepare
+    participant MOD as Classifier
+    participant EVA as evaluate.py
+    participant REP as report.py
+    participant FS as models/ folder
+
+    R->>CLI: mindclassify train --synthetic --out models
+    CLI->>CLI: Settings.from_env, merge the options
+    CLI->>PIPE: prepare(settings, synthetic)
+    PIPE->>PIPE: load, clean, group_duplicates, resolve, make_split
+    PIPE-->>CLI: Prepared with the split and the reports
+    loop for each model in --models, default majority,tfidf
+        CLI->>MOD: build(name, labels, seed).fit(train texts, train labels)
+        CLI->>EVA: calibrate_and_route(model, val, safety_recall)
+        EVA->>MOD: log_scores(val texts)
+        EVA-->>CLI: temperature, ECE before and after, safety threshold
+        CLI->>EVA: evaluate(model, test, threshold)
+        EVA->>MOD: predict_proba(test texts)
+        EVA-->>CLI: metrics, slices, safety metrics
+        CLI->>FS: save: model.json, model.joblib
+        CLI->>REP: model_card(meta, result)
+        REP->>FS: MODEL_CARD.md
+    end
+    CLI->>REP: markdown(results, prepared)
+    REP->>FS: report.md
+    CLI-->>R: report text
+    R->>CLI: mindclassify predict --model-dir models/tfidf --text
+    CLI->>FS: load: check template_version
+    CLI->>MOD: predict_proba(text)
+    CLI-->>R: top label, probabilities, route_to_human, disclaimer
+```
+
 ---
 
 ## 5. The loader and the cleaner
+
+```mermaid
+flowchart LR
+    IN[/"CSV table or synthetic table"/] --> COL{"statement and status<br/>columns present?"}
+    COL -- "no" --> ERR[/"SchemaError"/]
+    COL -- "yes" --> NL["normalise_label: case and space ignored,<br/>Bi-Polar to Bipolar"]
+    NL --> EMP{"Empty text?"}
+    EMP -- "yes" --> D1["Drop, count in empty_text"]
+    EMP -- "no" --> UNK{"Unknown label?"}
+    UNK -- "yes" --> D2["Drop, count in unknown_label,<br/>list the top 10 values"]
+    UNK -- "no" --> SRCC["source: the source column,<br/>else the file name"]
+    SRCC --> OUT[/"id, text, label, source<br/>and the LoadReport"/]
+```
 
 | Loader rule | Value |
 |---|---|
@@ -247,6 +413,27 @@ flowchart TB
 | Empty text | Dropped and counted |
 | Unknown label | Dropped, counted and listed (top 10 values) |
 | Source | The `source` column, else the file name |
+
+```mermaid
+flowchart LR
+    T[/"Post text and CleanConfig"/] --> H{"html?"}
+    H -- "on" --> H1["html.unescape,<br/>tags to spaces"]
+    H -- "off" --> U
+    H1 --> U{"urls?"}
+    U -- "on" --> U1["URL to the url placeholder"]
+    U -- "off" --> M
+    U1 --> M{"mentions?"}
+    M -- "on" --> M1["Mention to the user placeholder"]
+    M -- "off" --> S
+    M1 --> S{"expand_slang?<br/>default off"}
+    S -- "on" --> S1["Whole tokens only,<br/>keep the case style"]
+    S -- "off" --> L
+    S1 --> L{"lowercase?<br/>default off"}
+    L -- "on" --> L1["Lower case"]
+    L -- "off" --> W
+    L1 --> W["Join white space, strip"]
+    W --> OUT[/"Clean text, negations kept"/]
+```
 
 | Cleaner step | Default | Example |
 |---|---|---|
@@ -261,6 +448,25 @@ flowchart TB
 
 ## 6. Duplicate groups and the split
 
+```mermaid
+flowchart TD
+    IN[/"Clean posts"/] --> N["normalise: lower case,<br/>letters and digits, single spaces"]
+    N --> EX{"Same normalised text<br/>as an earlier post?"}
+    EX -- "yes" --> UF["UnionFind.union"]
+    EX -- "no" --> SH["Word 3-gram shingles"]
+    SH --> SIG["minhash_signatures:<br/>64 values for each post"]
+    SIG --> BAND["16 bands of 4 values,<br/>bucket by band"]
+    BAND --> CAND{"Same bucket and<br/>agreement at least 0.8?"}
+    CAND -- "yes" --> UF
+    CAND -- "no" --> SEP["Stay in separate groups"]
+    UF --> GRP["group ID for each post,<br/>DedupReport"]
+    SEP --> GRP
+    GRP --> RES{"resolve: two labels<br/>in the group?"}
+    RES -- "no" --> KEEP[/"Keep one post"/]
+    RES -- "yes, majority" --> KEEPM[/"Keep one post<br/>with the majority label"/]
+    RES -- "yes, tie" --> DROP[/"Drop the group"/]
+```
+
 **Procedure**
 
 1. Normalise each post: lower case, letters and digits only, single spaces.
@@ -269,8 +475,23 @@ flowchart TB
 4. Put signatures into 16 bands of 4 values. Posts with an equal band are candidates.
 5. Join two candidates if at least 80% of their signature values agree.
 6. Keep one post for each group. If the group has two labels, keep the majority label. If the labels tie, drop the group.
-7. Carve the test split (15%) with `StratifiedGroupKFold`, then the validation split (15% of all) from the rest.
+7. Carve the test split with `StratifiedGroupKFold` as 1 fold of round(1 / test size) folds. With the default 0.15, this is 1 fold of 7, about 14% of the posts. Then carve the validation split from the rest in the same way (1 fold of 6, also about 14% of all posts).
 8. Run `Split.check` and save the split IDs to `splits.json`.
+
+```mermaid
+flowchart LR
+    IN[/"Resolved posts with group IDs"/] --> T["_carve test:<br/>StratifiedGroupKFold, 7 folds by default, seed"]
+    T --> TEST[/"test: 1 fold"/]
+    T --> REST["rest: 6 folds"]
+    REST --> V["_carve validation:<br/>StratifiedGroupKFold, 6 folds by default, seed + 1"]
+    V --> VAL[/"val: 1 fold"/]
+    V --> TRAIN[/"train: 5 folds"/]
+    TEST --> CHK{"Split.check: a group or a<br/>normalised text on two sides?"}
+    VAL --> CHK
+    TRAIN --> CHK
+    CHK -- "yes" --> ERR[/"LeakageError"/]
+    CHK -- "no" --> SAVE[("splits.json<br/>train, val, test IDs")]
+```
 
 ---
 
@@ -281,6 +502,19 @@ Classify the mental-health category of the post. Answer with exactly one label f
 
 Post: <post text with single spaces>
 Label:
+```
+
+```mermaid
+flowchart LR
+    IN[/"Post text and label"/] --> TE{"training_example:<br/>label in the label set?"}
+    TE -- "no" --> ERR[/"ValueError"/]
+    TE -- "yes" --> BP["build_prompt: label list,<br/>post with single spaces"]
+    BP --> TOK["Tokenize the prompt<br/>and the completion"]
+    TOK --> FIT{"Prompt fits in<br/>max_length minus completion and EOS?"}
+    FIT -- "yes" --> JOIN["prompt + completion + EOS"]
+    FIT -- "no" --> CUT["Cut the end of the post,<br/>keep the instruction and the last 4 tokens"]
+    CUT --> JOIN
+    JOIN --> LAB[/"input_ids, and labels:<br/>-100 for the prompt, IDs for completion and EOS"/]
 ```
 
 | Item | Value |
@@ -295,6 +529,18 @@ Label:
 ---
 
 ## 8. The baselines
+
+```mermaid
+flowchart LR
+    TR[/"Train texts and labels"/] --> B{"build: model name"}
+    B -- "majority" --> MJ["MajorityClassifier.fit:<br/>log of smoothed label shares"]
+    B -- "tfidf" --> TF["TfidfClassifier.fit: word 1-2 grams<br/>+ char_wb 3-5 grams, sublinear"]
+    TF --> LR["LogisticRegression<br/>C 4, balanced class weights"]
+    MJ --> LS["log_scores: one column<br/>for each label, fixed order"]
+    LR --> LS
+    LS --> SM["predict_proba:<br/>softmax of log-scores / T"]
+    SM --> PR[/"Class probabilities<br/>and the top label"/]
+```
 
 | Model | What it is | Role |
 |---|---|---|
@@ -314,6 +560,20 @@ An LLM result is useful only if it is better than `tfidf` on macro-F1, with inte
 3. Run the model and sum the log-probabilities of the completion tokens.
 4. The 7 sums are the log-scores. A softmax with the temperature gives the probabilities.
 
+```mermaid
+flowchart LR
+    IN[/"Post text"/] --> BP["build_prompt"]
+    BP --> PT["Prompt token IDs"]
+    LBL[/"7 label completions"/] --> CT["Completion token IDs<br/>for each label"]
+    PT --> SEQ["7 sequences:<br/>prompt + label tokens"]
+    CT --> SEQ
+    SEQ --> FW["One batch through the 4-bit base model,<br/>with the adapter if given"]
+    FW --> LP["log_softmax, sum the log-probabilities<br/>of the label tokens"]
+    LP --> LS["7 log-scores"]
+    LS --> SM["softmax of log-scores / T"]
+    SM --> OUT[/"Class probabilities,<br/>no generated text"/]
+```
+
 **QLoRA training** (`mindclassify train-llm`, GPU)
 
 | Setting | Value |
@@ -329,6 +589,23 @@ An LLM result is useful only if it is better than `tfidf` on macro-F1, with inte
 
 After training, the command fits the temperature and the routing threshold on the validation split and writes them to `model.json`.
 
+```mermaid
+flowchart TD
+    IN[/"train-llm --seeds, train and val splits"/] --> SEED["For each seed:<br/>torch.manual_seed"]
+    SEED --> LOAD["Load the base model:<br/>4-bit NF4, double quantisation, bfloat16"]
+    LOAD --> PEFT["prepare_model_for_kbit_training,<br/>LoRA r 16, alpha 32, all linear layers"]
+    PEFT --> ENC["encode: build_prompt + completion + EOS,<br/>completion_only_labels"]
+    ENC --> TRN["Trainer: cosine schedule, paged AdamW 8-bit,<br/>evaluation after each epoch"]
+    TRN --> ES{"Validation loss better?"}
+    ES -- "no, patience 1" --> STOP["Stop early"]
+    ES -- "yes" --> TRN
+    STOP --> BEST["Best checkpoint"]
+    TRN -- "last epoch" --> BEST
+    BEST --> SAVE[("seedN/adapter,<br/>model.json")]
+    SAVE --> CAL["load, calibrate_and_route on val"]
+    CAL --> META[("model.json:<br/>temperature, safety_threshold")]
+```
+
 ---
 
 ## 10. Calibration
@@ -338,9 +615,40 @@ After training, the command fits the temperature and the routing threshold on th
 3. Store T in the model folder. Every prediction divides the log-scores by T before the softmax.
 4. Report the ECE (15 equal-width confidence bins) before and after.
 
+```mermaid
+flowchart LR
+    VAL[/"Validation posts"/] --> Z["model.log_scores"]
+    Z --> E1["ECE before, T = 1"]
+    Z --> FIT["fit_temperature: minimize_scalar<br/>of the NLL, T in 0.05 to 20"]
+    FIT --> T["model.temperature = T"]
+    T --> E2["ECE after,<br/>softmax of log-scores / T"]
+    T --> THR["safety_threshold on the<br/>calibrated P(Suicidal)"]
+    E1 --> OUT[/"calibration: temperature,<br/>val_ece_before, val_ece_after, safety_threshold"/]
+    E2 --> OUT
+    THR --> OUT
+```
+
 ---
 
 ## 11. The safety routing rule
+
+```mermaid
+flowchart TD
+    VAL[/"Calibrated P(Suicidal)<br/>of the validation Suicidal posts"/] --> SORT["Sort from high to low"]
+    SORT --> K["Index ceil of target recall x count, minus 1<br/>MINDCLASSIFY_SAFETY_RECALL"]
+    K --> T[("Threshold t<br/>in model.json")]
+    NEW[/"New post"/] --> P["predict_proba: P(Suicidal)"]
+    NEW --> PH["phrase_flags: CRISIS_PHRASES"]
+    T --> R{"P(Suicidal) at or above t,<br/>or a crisis phrase?"}
+    P --> R
+    PH --> R
+    R -- "yes" --> NOTE["route_to_human true,<br/>routing_note with the reason"]
+    NOTE --> HUMAN{{"HUMAN<br/>trained reviewer and crisis resources"}}
+    R -- "no" --> NR[/"route_to_human false"/]
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
+```
 
 **Procedure**
 
@@ -358,6 +666,21 @@ After training, the command fits the temperature and the routing threshold on th
 ---
 
 ## 12. The evaluation and the report
+
+```mermaid
+flowchart LR
+    TE[/"Test split, model,<br/>safety threshold"/] --> PP["predict_proba"]
+    PP --> MET["metrics: macro-F1, balanced accuracy,<br/>accuracy, ECE, per-class, confusion"]
+    PP --> BOOT["macro_f1_ci: 1,000<br/>bootstrap samples"]
+    PP --> SL["slices: source,<br/>length bucket"]
+    PP --> SAF["safety_metrics: threshold rule,<br/>and with phrases"]
+    MET --> RES["Result for each model"]
+    BOOT --> RES
+    SL --> RES
+    SAF --> RES
+    RES --> MD[/"report.md: summary, per-class,<br/>calibration, routing, slices"/]
+    RES --> MC[/"MODEL_CARD.md: intended use,<br/>model, performance, limits"/]
+```
 
 | Output | Content |
 |---|---|
@@ -428,6 +751,21 @@ mindclassify prepare
 mindclassify train --out models
 mindclassify train-llm --seeds 42,43,44 --out models/qlora
 mindclassify evaluate --model-dir models/qlora/seed42 --out out/qlora42
+```
+
+Each command runs `prepare` again with the same seed, so all commands use the same split. The files connect the commands in this sequence:
+
+```mermaid
+flowchart LR
+    PR["prepare"] --> SJ[("out/splits.json")]
+    TR["train"] --> MF[("models/majority, models/tfidf,<br/>models/report.md")]
+    TL["train-llm, GPU"] --> QF[("models/qlora/seedN")]
+    MF --> EV["evaluate --model-dir"]
+    QF --> EV
+    EV --> RP[("out/report.md")]
+    MF --> PD["predict --model-dir --text"]
+    QF --> PD
+    PD --> JS[/"JSON: top label, probabilities,<br/>routing, disclaimer"/]
 ```
 
 ### 14.4 Environment variables
